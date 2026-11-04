@@ -1,0 +1,15 @@
+{
+  "name": "pocket-ledger-api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "deploy": "wrangler deploy --config wrangler.toml --name pocket-ledger-api",
+    "dev": "wrangler dev --config wrangler.toml --name pocket-ledger-api",
+    "start": "wrangler dev --config wrangler.toml --name pocket-ledger-api",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "wrangler": "^4.156.0"
+  }
+}
