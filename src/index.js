@@ -1,6 +1,7 @@
 import { MerchantClassificationIndex, readMerchantClassifications, saveImportCategoryExceptions } from './merchant-classifications.js';
 import { expenseType, recurringMerchants, suggestExpenseType } from './expense-types.js';
-import { emailCaptureRequest, emailConfigured, scheduledEmailScans, possibleEmailDuplicate } from './email-capture.js';
+import {retiredEmailRequest} from './email-retirement.js';
+import {possibleEmailDuplicate} from './historical-email-duplicates.js';
 const RULES = {
     "Food / Household": [
         "restaurant", "restoran", "kitchen", "food", "cafe", "coffee", "bakery", "deli", "diner",
@@ -201,11 +202,12 @@ function isInternalTransfer(description) {
 const RANGE = "Sheet1!A1:G";
 export default {
 	async fetch(req, env = {}) {
-        if (new URL(req.url).pathname.startsWith('/email/')) return emailCaptureRequest(req, env);
+        if (new URL(req.url).pathname.startsWith('/email/')) return retiredEmailRequest(req, env);
 		if (req.method === "OPTIONS") return cors();
 		if (req.method === "GET") return out({
 			status: "ok",
-            emailCapture: emailConfigured(env),
+            emailCapture: false,
+            emailCaptureRetired: true,
 			reviewPreview: true,
             expenseTypeReview: true,
             merchantClassificationReview: true,
@@ -385,9 +387,7 @@ export default {
 			}, 500);
 		}
 	},
-    async scheduled(controller, env, ctx) {
-        ctx.waitUntil(scheduledEmailScans(env, controller.scheduledTime));
-    }
+    async scheduled() { /* Retired: stale cron invocations must never access Gmail. */ }
 };
 
 function parseCsv(s) {
