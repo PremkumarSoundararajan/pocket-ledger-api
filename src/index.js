@@ -1,3 +1,6 @@
+import { MerchantClassificationIndex, readMerchantClassifications, saveImportCategoryExceptions } from './merchant-classifications.js';
+import { expenseType, recurringMerchants, suggestExpenseType } from './expense-types.js';
+import { emailCaptureRequest, emailConfigured, scheduledEmailScans, possibleEmailDuplicate } from './email-capture.js';
 const RULES = {
     "Food / Household": [
         "restaurant", "restoran", "kitchen", "food", "cafe", "coffee", "bakery", "deli", "diner",
@@ -197,11 +200,15 @@ function isInternalTransfer(description) {
 }
 const RANGE = "Sheet1!A1:G";
 export default {
-	async fetch(req) {
+	async fetch(req, env = {}) {
+        if (new URL(req.url).pathname.startsWith('/email/')) return emailCaptureRequest(req, env);
 		if (req.method === "OPTIONS") return cors();
 		if (req.method === "GET") return out({
 			status: "ok",
+            emailCapture: emailConfigured(env),
 			reviewPreview: true,
+            expenseTypeReview: true,
+            merchantClassificationReview: true,
 			reviewedCategoryUpdates: true,
 		});
 		if (req.method !== "POST") return out({
@@ -224,7 +231,8 @@ export default {
 			const action = (req.headers.get("X-Action") || "import").toLowerCase();
 			if (action !== "preview" && action !== "import") return out({ error: "X-Action must be preview or import" }, 400);
 			let txs;
-			const spreadsheetId = await ensureTransactionTab(id, token);
+			const ensured = await ensureTransactionTab(id, token);
+            const spreadsheetId = ensured.spreadsheetId;
 			const spreadsheetCreated = spreadsheetId !== id;
 			const base = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values/${encodeURIComponent(RANGE)}`;
 			const get = await fetch(base, {
@@ -260,10 +268,14 @@ export default {
             txs = normalize(parseCsv(body), categoryConfig, action === "import");
             // key -> sheet row number (1-based, header is row 1). Built from the live sheet on every request.
 			const seen = new Map();
+            const merchantState = await readMerchantClassifications(spreadsheetId, token, ensured.merchantTabExists);
+            const merchantIndex = new MerchantClassificationIndex(merchantState.records.values());
+            const importExceptions = [];
+            const patterns = recurringMerchants((sheet.values || []).slice(1).map(row => [dateOf(row[0]), ...row.slice(1)]));
 			(sheet.values || []).slice(1).forEach((row, index) => {
 				const rk = rowKey(row);
 				if (rk && !seen.has(rk)) {
-					seen.set(rk, { row: index + 2, category: String(row[2] || "").trim() });
+					seen.set(rk, { row: index + 2, category: String(row[2] || "").trim(), expenseType: expenseType(row[4]), transactionId: String(row[5] || "") });
 				}
 			});
 			const allowDuplicates = (req.headers.get("X-Allow-Duplicates") || "").toLowerCase() === "true";
@@ -279,9 +291,27 @@ export default {
 					continue;
 				}
 				const k = key(t.date, t.amount, t.description);
-				const existing = k ? seen.get(k) : undefined;
+				const emailMatchIndex = (sheet.values || []).findIndex((row,index) => index>0 && String(row[5]||'').startsWith('email:') && possibleEmailDuplicate({date:t.date,amount:t.amount,merchant:t.description},row));
+                const emailMatch = emailMatchIndex < 0 ? undefined : {row:emailMatchIndex+1,category:String(sheet.values[emailMatchIndex][2]||''),expenseType:expenseType(sheet.values[emailMatchIndex][4]),transactionId:sheet.values[emailMatchIndex][5]};
+                const existing = (k ? seen.get(k) : undefined) || emailMatch;
 				const duplicateRow = existing?.row;
 				const duplicate = existing !== undefined;
+                if (!t.categoryReviewed) {
+                    const master = merchantIndex.categoryFor(t.description, existing?.transactionId);
+                    if (master.category) { t.category = master.category; t.categoryId = master.categoryId || ''; t.categoryMatched = true; }
+                }
+                const transactionId = (duplicate && (t.importAnyway || allowDuplicates)) ? crypto.randomUUID() : existing?.transactionId || crypto.randomUUID();
+                if (action === 'import' && (t.categoryReviewed || t.expenseTypeReviewed)) {
+                    const id = 't:' + transactionId;
+                    importExceptions.push({...(merchantState.records.get(id)?.deleted ? {} : merchantState.records.get(id)), id, kind: 'transaction', transactionId,
+                        ...(t.categoryReviewed ? {category: t.category, categoryId: t.categoryId} : {}), ...(t.expenseTypeReviewed ? {expenseType: t.expenseType} : {}), deleted: false});
+                }
+                if (!t.expenseTypeReviewed) {
+                    const typeRule = merchantIndex.merchantFor(t.description);
+                    const typeException = merchantIndex.exceptions.get(existing?.transactionId);
+                    t.expenseType = typeException?.expenseType ?? typeRule?.expenseType ?? (existing ? existing.expenseType : t.expenseTypeProvided ? t.expenseType : suggestExpenseType(t, patterns));
+                    t.expenseTypeSource = existing && existing.expenseType !== 'Unknown' ? 'Saved' : t.expenseType === 'Regular' ? 'Suggested' : 'Needs Review';
+                }
 				if (duplicate) {
 					duplicates++;
 				}
@@ -291,24 +321,28 @@ export default {
 						duplicate,
 						duplicateRow: duplicate ? duplicateRow : null,
 						existingCategory: duplicate ? existing.category : null,
+                        existingExpenseType: duplicate ? existing.expenseType : null,
+                        transactionId: duplicate ? existing.transactionId || null : null,
 					});
 					continue;
 				}
 				if (duplicate && !t.importAnyway && !allowDuplicates) {
-					if (t.category && t.category !== existing.category) {
-						categoryUpdates.push({ row: duplicateRow, category: t.category, categoryId: t.categoryId });
+					if ((t.category && t.category !== existing.category) || t.expenseTypeReviewed || t.categoryReviewed) {
+						categoryUpdates.push({ row: duplicateRow, category: t.category, categoryId: t.categoryId, expenseType: t.expenseTypeReviewed ? t.expenseType : undefined, transactionId: !existing.transactionId && t.categoryReviewed ? transactionId : undefined });
 					} else {
 						skippedDuplicates++;
 					}
 					continue;
 				}
-				values.push([t.date, t.amount, t.category, t.description, t.expenseType, crypto.randomUUID(), t.categoryId || ""]);
+				values.push([t.date, t.amount, t.category, t.description, t.expenseType, transactionId, t.categoryId || ""]);
 			}
 			if (action === "preview") return out({ status: "preview", spreadsheetId, spreadsheetCreated, rows: previewRows, filtered, duplicates });
-			if (categoryUpdates.length) {
+			await saveImportCategoryExceptions(spreadsheetId, token, merchantState, importExceptions);
+            if (categoryUpdates.length) {
 				await updateCategories(spreadsheetId, token, categoryUpdates);
 			}
-			if (!values.length) return out({
+			if (!values.length) {
+                return out({
 				status: "success",
 				spreadsheetId,
 				spreadsheetCreated,
@@ -318,9 +352,10 @@ export default {
 				skipped: skippedDuplicates,
 				filtered,
 				message: categoryUpdates.length
-					? `Updated ${categoryUpdates.length} existing transaction categor${categoryUpdates.length === 1 ? "y" : "ies"}.`
+					? `Updated ${categoryUpdates.length} existing transaction classification${categoryUpdates.length === 1 ? "" : "s"}.`
 					: "No new expenses to import."
 			});
+			}
 			const post = await fetch(`${base}:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS`, {
 				method: "POST",
 				headers: {
@@ -349,7 +384,10 @@ export default {
 				error: e?.message || "Unexpected error"
 			}, 500);
 		}
-	}
+	},
+    async scheduled(controller, env, ctx) {
+        ctx.waitUntil(scheduledEmailScans(env, controller.scheduledTime));
+    }
 };
 
 function parseCsv(s) {
@@ -417,7 +455,10 @@ export function normalize(rows, categoryConfig = null, honorReviewed = false) {
 		ci = find(["creditamount", "depositamount", "deposit", "credit"]),
 		ai = find(["transactionamount", "purchaseamount", "amount", "totalamount", "sum", "cost"]),
 		ti = find(["transactiontype", "debitcredit", "creditdebit", "drcr", "type"]),
-		ii = find(["importanyway", "appendduplicate"]);
+		ii = find(["importanyway", "appendduplicate"]),
+        ei = find(["expensetype"]),
+        eri = find(["expensetypereviewed"]),
+        cri = find(["categoryreviewed"]);
 	if (di < 0 || si < 0 || (ai < 0 && bi < 0 && ci < 0)) throw Error("Could not detect date, description, amount/debit CSV columns.");
 	const out = [];
 	const hasSignedAmountConvention = ai >= 0 &&
@@ -466,12 +507,16 @@ export function normalize(rows, categoryConfig = null, honorReviewed = false) {
 			date,
 			amount: Math.abs(a),
 			category: finalCategory,
+            categoryReviewed: honorReviewed && cri >= 0 && ["true","1","yes"].includes(norm(r[cri])),
 			categoryId: resolved.categoryId || parentIdForName(finalCategory),
 			categoryMatched: !resolved.ambiguous && (internalTransfer || Boolean(category) || Boolean(resolved.categoryId)),
 			categoryAmbiguous: resolved.ambiguous === true,
 			description: desc,
 			importAnyway: ii >= 0 && ["true", "1", "yes"].includes(norm(r[ii])),
-			expenseType: /tax|property/i.test(desc) || category === "Financial Obligations" ? "Occasional" : "Regular"
+			expenseType: honorReviewed && ei >= 0 ? expenseType(r[ei]) : 'Unknown',
+            expenseTypeProvided: honorReviewed && ei >= 0,
+            expenseTypeReviewed: honorReviewed && eri >= 0 && ['true','1','yes'].includes(norm(r[eri])),
+            expenseTypeSource: honorReviewed && eri >= 0 && ['true','1','yes'].includes(norm(r[eri])) ? 'Confirmed' : 'Needs Review'
 		});
 	}
 	return out;
@@ -536,11 +581,11 @@ async function ensureTransactionTab(spreadsheetId, token) {
 	let spreadsheet = await json(response);
 	if (!response.ok) {
 		if (response.status === 404) {
-			return createTransactionSpreadsheet(token);
+			return {spreadsheetId: await createTransactionSpreadsheet(token), merchantTabExists: false};
 		}
 		throw Error(`Google Sheets spreadsheet lookup error: ${spreadsheet.error?.message||response.statusText}`);
 	}
-	if (spreadsheet.sheets?.some(sheet => sheet.properties?.title === "Sheet1")) return spreadsheetId;
+	if (spreadsheet.sheets?.some(sheet => sheet.properties?.title === "Sheet1")) return {spreadsheetId, merchantTabExists: spreadsheet.sheets.some(sheet => sheet.properties?.title === "Merchant Classifications")};
 
 	const createUrl = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}:batchUpdate`;
 	response = await fetch(createUrl, {
@@ -570,7 +615,7 @@ async function ensureTransactionTab(spreadsheetId, token) {
 			["Timestamp", "Amount", "Category", "Description", "Expense Type", "Transaction ID", "Category ID"]
 		], "header initialization");
 	}
-	return spreadsheetId;
+	return {spreadsheetId, merchantTabExists: spreadsheet.sheets?.some(sheet => sheet.properties?.title === "Merchant Classifications") || false};
 }
 
 async function createTransactionSpreadsheet(token) {
@@ -616,7 +661,9 @@ async function writeSheetValues(spreadsheetId, token, range, values, operation) 
 
 async function updateCategories(spreadsheetId, token, updates) {
 	const url = `https://sheets.googleapis.com/v4/spreadsheets/${encodeURIComponent(spreadsheetId)}/values:batchUpdate`;
-	const data = updates.flatMap(({ row, category, categoryId }) => [
+	const data = updates.flatMap(({ row, category, categoryId, expenseType: reviewedType, transactionId }) => [
+        ...(transactionId ? [{ range: `Sheet1!F${row}`, values: [[transactionId]] }] : []),
+        ...(reviewedType !== undefined ? [{ range: `Sheet1!E${row}`, values: [[reviewedType]] }] : []),
 		{ range: `Sheet1!C${row}`, values: [[category]] },
 		{ range: `Sheet1!G${row}`, values: [[categoryId || ""]] },
 	]);
@@ -689,7 +736,9 @@ function resolveCategory(description, row, headers, config, fallback, honorRevie
 	if (honorReviewed && (chosenName || chosenId)) {
 		const chosen = active.find(category => (chosenId && category.id === chosenId) || (chosenName && head(category.name) === head(chosenName)));
 		if (chosen) return { category: chosen.name, categoryId: chosen.id };
-		if (head(chosenName) === head("Transfers")) return { category: "Transfers", categoryId: "transfers" };
+		const parent = parentIdForName(chosenName);
+        if (parent) return {category: chosenName, categoryId: parent};
+        if (head(chosenName) === head("Transfers")) return { category: "Transfers", categoryId: "transfers" };
 	}
 	const normalized = norm(description);
 	const mappings = Array.isArray(config?.mappings) ? config.mappings : [];

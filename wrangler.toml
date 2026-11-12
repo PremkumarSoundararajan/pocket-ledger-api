@@ -1,3 +1,33 @@
 name = "pocket-ledger-api"
-main = "src/index.js"
+main = "src/worker.js"
 compatibility_date = "2026-10-23"
+
+[triggers]
+crons = [] # Explicitly remove previously deployed scheduled email scans.
+
+[[durable_objects.bindings]]
+name = "EMAIL_SCAN_JOBS"
+class_name = "EmailScanJob"
+
+[[migrations]]
+tag = "email-jobs-v1"
+new_sqlite_classes = ["EmailScanJob"]
+
+[[d1_databases]]
+binding = "EMAIL_DB"
+database_name = "pocket-ledger-email"
+database_id = "cc83616a-aad1-46d1-a294-c2caadd7f222"
+migrations_dir = "migrations"
+
+[env.production]
+name = "pocket-ledger-api-production"
+
+[[env.production.durable_objects.bindings]]
+name = "EMAIL_SCAN_JOBS"
+class_name = "EmailScanJob"
+
+[[env.production.d1_databases]]
+binding = "EMAIL_DB"
+database_name = "pocket-ledger-email"
+database_id = "cc83616a-aad1-46d1-a294-c2caadd7f222"
+migrations_dir = "migrations"

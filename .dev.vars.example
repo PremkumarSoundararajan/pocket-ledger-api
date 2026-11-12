@@ -1,0 +1,7 @@
+# Copy to ignored .dev.vars for local testing. Never commit actual credentials.
+EMAIL_CAPTURE_ENABLED=false
+EMAIL_OAUTH_CLIENT_ID=
+EMAIL_OAUTH_CLIENT_SECRET=
+EMAIL_CALLBACK_URL=http://localhost:8787/email/oauth/callback
+EMAIL_TOKEN_KEY=
+EMAIL_ALLOWED_ORIGINS=http://localhost:8080
